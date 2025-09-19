@@ -32,8 +32,11 @@ jobs:
         # Dependencias de aplicación + pytest
 
       - name: Run unit tests
-        run: pytest -q
-        # Ejecuta tests; si falla, se detiene el pipeline
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH"
+          pytest -q tests/ -vv
 
       - name: Lint Dockerfile (hadolint)
         uses: hadolint/hadolint-action@v3.1.0
