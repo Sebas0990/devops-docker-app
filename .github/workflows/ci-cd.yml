@@ -105,78 +105,88 @@ jobs:
         # Escaneo de vulnerabilidades (ajusta exit-code a '1' para bloquear)
 
   # ===== CD: despliegue remoto por SSH =====
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: ${{ github.ref == 'refs/heads/main' && secrets.SSH_HOST && secrets.SSH_USER && secrets.SSH_KEY }}
+  #
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+deploy:
+  needs: build-and-push
+  runs-on: ubuntu-latest
 
-      - name: Check SSH reachability
-        id: reach
-        shell: bash
-        run: |
-          H="${{ secrets.SSH_HOST }}"
-          # intento de conexión TCP al 22 con timeout 5s
-          (timeout 5 bash -lc ">/dev/tcp/${H}/22") && echo "ok=true"  >> $GITHUB_OUTPUT \
-                                             || echo "ok=false" >> $GITHUB_OUTPUT
+  steps:
+    # 1) Gate: ¿tenemos los 3 secrets?
+    - name: Gate deploy (check secrets)
+      id: gate
+      env:
+        HAS_HOST: ${{ secrets.SSH_HOST }}
+        HAS_USER: ${{ secrets.SSH_USER }}
+        HAS_KEY:  ${{ secrets.SSH_KEY }}
+      shell: bash
+      run: |
+        if [[ -n "$HAS_HOST" && -n "$HAS_USER" && -n "$HAS_KEY" ]]; then
+          echo "ok=true"  >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
 
-      - name: Skip gracefully if host not reachable
-        if: steps.reach.outputs.ok != 'true'
-        run: |
-          echo "SSH no alcanzable (${ { secrets.SSH_HOST } }). Omitiendo deploy de forma segura."
-          exit 0
+    # Si faltan secrets, deja constancia y salta el deploy
+    - name: Skip deploy (no SSH secrets)
+      if: steps.gate.outputs.ok != 'true'
+      run: echo "No hay SSH_HOST/SSH_USER/SSH_KEY. Omitiendo deploy de forma segura."
 
-      - name: Get version from previous job
-        id: getver
-        run: |
-          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-            VERSION=$(git describe --tags --abbrev=0)
-          else
-            VERSION="0.0.0-$(git rev-parse --short HEAD)"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-        # Recupera la versión para desplegar esa misma imagen
+    - name: Checkout
+      if: steps.gate.outputs.ok == 'true'
+      uses: actions/checkout@v4
 
-      - name: Setup SSH
-        if: steps.reach.outputs.ok == 'true'
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_KEY }}
-        # Carga la clave privada en un agente SSH temporal
+    # 2) Reachability: ¿22/tcp abierto?
+    - name: Check SSH reachability
+      if: steps.gate.outputs.ok == 'true'
+      id: reach
+      shell: bash
+      run: |
+        H="${{ secrets.SSH_HOST }}"
+        # test TCP con /dev/tcp (sin dependencias externas)
+        if timeout 5 bash -lc "echo >/dev/tcp/${H}/22"; then
+          echo "ok=true"  >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
 
-      - name: Deploy via SSH
-        if: steps.reach.outputs.ok == 'true'
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
-          set -e
-          export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
-          export TAG=${{ steps.getver.outputs.version }}
-          export APP_PORT=${{ secrets.APP_PORT }}
-          mkdir -p /opt/devops-docker-app
-          cd /opt/devops-docker-app
+    - name: Skip deploy (host no accesible)
+      if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok != 'true'
+      run: echo "Host ${{ secrets.SSH_HOST }} no accesible por SSH. Omitiendo deploy."
 
-          # Escribir/actualizar compose (opcional si ya existe)
-          cat > docker-compose.prod.yml << 'COMPOSE'
-          services:
-            web:
-              image: ${DOCKERHUB_USERNAME}/devops-docker-app:${TAG}
-              restart: unless-stopped
-              ports:
-                - "${APP_PORT:-8080}:8080"
-              healthcheck:
-                test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-                interval: 30s
-                timeout: 3s
-                retries: 3
-          COMPOSE
+    - name: Setup SSH
+      if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_KEY }}
 
-          docker compose -f docker-compose.prod.yml pull
-          docker compose -f docker-compose.prod.yml up -d
+    - name: Deploy via SSH
+      if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
+      shell: bash
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+        set -e
+        export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+        export TAG=${GITHUB_SHA::7}
+        export APP_PORT=${{ secrets.APP_PORT }}
+        mkdir -p /opt/devops-docker-app
+        cd /opt/devops-docker-app
 
-          # Verifica salud rápida
-          sleep 5
-          docker ps
-          EOF
+        cat > docker-compose.prod.yml << 'COMPOSE'
+        services:
+          web:
+            image: ${DOCKERHUB_USERNAME}/devops-docker-app:${TAG}
+            restart: unless-stopped
+            ports:
+              - "${APP_PORT:-8080}:8080"
+            healthcheck:
+              test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+              interval: 30s
+              timeout: 3s
+              retries: 3
+        COMPOSE
+
+        docker compose -f docker-compose.prod.yml pull
+        docker compose -f docker-compose.prod.yml up -d
+        docker ps
+        EOF
